@@ -12,6 +12,7 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <Preferences.h>
 
 // ── Multiplexer (CD4067) pins ────────────────────────────────
 #define S0 12
@@ -61,6 +62,7 @@ float error          = 0;
 float previous_error = 0;
 float integral       = 0;
 float derivative     = 0;
+float lastCorrection = 0;   // last PID correction (for graph)
 
 // ── Lost-line / dotted-line state ────────────────────────────
 float lastValidError    = 0;    // direction to spin when lost
@@ -70,6 +72,18 @@ unsigned long lastLineSeenMs = 0; // timestamp of last line detection
 // ── Dotted line: how long (ms) to coast before declaring lost ─
 // Increase if your dotted gaps are wider / bot is slower
 #define DOTTED_COAST_MS   120
+
+// ── Race / lap tracking ──────────────────────────────────────
+unsigned long runStartMs      = 0;   // set when /start
+bool          raceFinished    = false;
+unsigned long finishTimeMs    = 0;
+int           lapCount        = 0;
+bool          wideLineLatched = false;  // debounce for finish/lap edge
+#define WIDE_LINE_ACTIVE_SENSORS 13
+#define WIDE_LINE_HOLD_MS        700
+unsigned long wideLineStartMs = 0;
+#define LAUNCH_GRACE_MS 800   // motors stay stopped this long after /start
+#define ERROR_HYST       250  // hysteresis band around threshold (ADC counts)
 
 // ── Lost-line recovery: how long to spin before giving up ─────
 #define RECOVERY_TIMEOUT_MS 2000
@@ -82,6 +96,9 @@ volatile bool blackLineOnWhite = true;
 // ── Tank steering ────────────────────────────────────────────
 #define TANK_ERROR_THRESHOLD 35   // |error| above this → tank steer
 #define TANK_TURN_MULTIPLIER 0.8f
+
+// ── Per-sensor on-line state (for threshold hysteresis) ─────
+bool sensorOnLinePrev[IR_SENSOR_COUNT] = {false};
 
 // ── Moving average filter ────────────────────────────────────
 #define FILTER_N 4
@@ -99,6 +116,7 @@ volatile bool calibrationDone = false;
 volatile bool shouldRun       = false;
 
 AsyncWebServer server(80);
+Preferences prefs;
 
 // ── Forward declarations ─────────────────────────────────────
 void selectMuxChannel(byte channel);
@@ -177,6 +195,7 @@ void resetPIDState()
     sensorFilterBuf[i][0] = sensorFilterBuf[i][1] =
     sensorFilterBuf[i][2] = sensorFilterBuf[i][3] = 0;
     sensorFilterIdx[i] = 0;
+    sensorOnLinePrev[i] = false;
   }
 }
 
@@ -211,15 +230,17 @@ float getLineError()
       mapped = (int)constrain(map(filtered, minValues[i], maxValues[i], 0, 4095), 0, 4095);
     }
 
-    // ── Surface inversion ──────────────────────────────────
-    // Black line on white: sensor gives LOW ADC on line → mapped LOW → on line when mapped < threshold
-    // White line on black: sensor gives HIGH ADC on line → mapped HIGH → on line when mapped > threshold
+    // ── Surface inversion (with hysteresis band) ─────────────
+    bool prevOn = sensorOnLinePrev[i];
     bool onLine;
     if (blackLineOnWhite) {
-      onLine = (mapped < medianValues[i]);
+      onLine = prevOn ? (mapped < medianValues[i] + ERROR_HYST)
+                      : (mapped < medianValues[i] - ERROR_HYST);
     } else {
-      onLine = (mapped > medianValues[i]);
+      onLine = prevOn ? (mapped > medianValues[i] - ERROR_HYST)
+                      : (mapped > medianValues[i] + ERROR_HYST);
     }
+    sensorOnLinePrev[i] = onLine;
 
     sensorStates[i] = onLine ? 1 : 0;
 
@@ -295,6 +316,16 @@ void setup()
   WiFi.softAP("PID-Bot", "447643899");
   Serial.print("[WIFI] AP IP: ");
   Serial.println(WiFi.softAPIP());
+
+  // ── Load saved settings from NVS ───────────────────────────
+  prefs.begin("pidbot", false);
+  Kp               = prefs.getFloat("kp",    2.0f);
+  Ki               = prefs.getFloat("ki",    0.0f);
+  Kd               = prefs.getFloat("kd",    1.0f);
+  baseSpeed        = prefs.getInt ("speed", 200);
+  blackLineOnWhite = prefs.getBool("blw",   true);
+  Serial.printf("[NVS] Kp=%.2f Ki=%.3f Kd=%.2f speed=%d blw=%d\n",
+                (float)Kp, (float)Ki, (float)Kd, (int)baseSpeed, (int)blackLineOnWhite);
 
   // ── Web dashboard ──────────────────────────────────────────
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -485,6 +516,21 @@ void setup()
       </div>
     </div>
 
+    <div style='display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px'>
+      <div style='background:rgba(0,0,0,0.2);padding:10px;border-radius:10px;text-align:center'>
+        <div style='font-size:.7rem;color:#a0aec0;text-transform:uppercase'>Time</div>
+        <div style='font-size:1.1rem;font-weight:700;color:#00ffcc' id='timeV'>--</div>
+      </div>
+      <div style='background:rgba(0,0,0,0.2);padding:10px;border-radius:10px;text-align:center'>
+        <div style='font-size:.7rem;color:#a0aec0;text-transform:uppercase'>Laps</div>
+        <div style='font-size:1.1rem;font-weight:700;color:#00ffcc' id='lapV'>0</div>
+      </div>
+    </div>
+
+    <h3 style='margin-bottom:8px'>&#128200; Error / Correction</h3>
+    <canvas id='errGraph' width='460' height='80'
+      style='width:100%;height:80px;background:rgba(0,0,0,0.2);border-radius:10px;margin-bottom:14px'></canvas>
+
     <!-- Raw ADC bar graph -->
     <h3 style='margin-bottom:8px'>&#128202; Raw ADC Values</h3>
     <svg id='adcSvg' viewBox='0 0 480 80' style='width:100%;height:80px'></svg>
@@ -519,8 +565,21 @@ void setup()
       r.setAttribute('rx', 3); r.setAttribute('fill', '#1e293b');
       r.id = 'abar' + i;
       svg.appendChild(r);
+      var l1 = document.createElementNS(SVG_NS, 'line');
+      l1.id = 'lmn' + i; l1.setAttribute('stroke', '#f59e0b'); l1.setAttribute('stroke-width','2');
+      var l2 = document.createElementNS(SVG_NS, 'line');
+      l2.id = 'lmx' + i; l2.setAttribute('stroke', '#ef4444'); l2.setAttribute('stroke-width','2');
+      svg.appendChild(l1); svg.appendChild(l2);
     }
   })();
+
+  // ── Hotkey: Space = E-Stop ──────────────────────────────────
+  window.addEventListener('keydown', function(e) {
+    if (e.code === 'Space') { e.preventDefault(); stopRun(); }
+  });
+
+  // ── Rolling history for error graph ─────────────────────────
+  var errHist = [], corrHist = [];
 
   // ── Freeze flag: stops poll overwriting sliders after Apply ──
   var pidFrozen = false;
@@ -655,8 +714,9 @@ void setup()
         'dot ' + (d.sensorStates[i] ? 'don' : 'doff');
     }
 
-    // ADC bars
-    var H = 80;
+    // ADC bars with min/max markers
+    var H = 80, W = 480, N = 16, gap = 4;
+    var bw = (W - gap * (N - 1)) / N;
     for (var i = 0; i < 16; i++) {
       var bar = document.getElementById('abar' + i);
       if (!bar || !d.sensorValues) continue;
@@ -664,6 +724,50 @@ void setup()
       bar.setAttribute('height', h);
       bar.setAttribute('y', H - h - 5);
       bar.setAttribute('fill', d.sensorStates[i] ? '#00ffcc' : '#1e293b');
+
+      if (d.sensorMin && d.sensorMax) {
+        var x = i * (bw + gap);
+        var hMn = ((4095 - d.sensorMin[i]) / 4095) * 65;
+        var hMx = ((4095 - d.sensorMax[i]) / 4095) * 65;
+        var l1 = document.getElementById('lmn' + i), l2 = document.getElementById('lmx' + i);
+        if (l1) { l1.setAttribute('x1',x); l1.setAttribute('x2',x+bw);
+                  l1.setAttribute('y1',H-hMn-5); l1.setAttribute('y2',H-hMn-5); }
+        if (l2) { l2.setAttribute('x1',x); l2.setAttribute('x2',x+bw);
+                  l2.setAttribute('y1',H-hMx-5); l2.setAttribute('y2',H-hMx-5); }
+      }
+    }
+
+    // Time + laps + finished state
+    document.getElementById('lapV').textContent = d.lapCount;
+    var tEl = document.getElementById('timeV');
+    if (d.finished) { tEl.textContent = (d.finishTimeMs/1000).toFixed(2) + 's'; }
+    else if (d.running) { tEl.textContent = (d.elapsedMs/1000).toFixed(1) + 's'; }
+    else { tEl.textContent = '--'; }
+
+    if (d.finished) {
+      stateEl.textContent = 'Finished'; stateEl.style.color = '#00ffcc';
+    }
+
+    // Error/correction graph
+    errHist.push(d.error); corrHist.push(d.correction || 0);
+    if (errHist.length > 120) { errHist.shift(); corrHist.shift(); }
+    var cv = document.getElementById('errGraph');
+    if (cv) {
+      var c = cv.getContext('2d');
+      c.clearRect(0, 0, cv.width, cv.height);
+      c.strokeStyle = 'rgba(255,255,255,0.15)';
+      c.beginPath(); c.moveTo(0, cv.height/2); c.lineTo(cv.width, cv.height/2); c.stroke();
+      function plot(hist, color) {
+        c.strokeStyle = color; c.lineWidth = 2; c.beginPath();
+        for (var i = 0; i < hist.length; i++) {
+          var x = i / 119 * cv.width;
+          var y = cv.height/2 - (hist[i] / 75) * (cv.height/2 - 4);
+          i === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
+        }
+        c.stroke();
+      }
+      plot(corrHist, '#a78bfa');
+      plot(errHist,  '#00ffcc');
     }
   }
 
@@ -690,6 +794,7 @@ void setup()
     if (request->hasParam("ki")) Ki = request->getParam("ki")->value().toFloat();
     if (request->hasParam("kd")) Kd = request->getParam("kd")->value().toFloat();
     Serial.printf("[PID] Kp=%.3f Ki=%.4f Kd=%.3f\n", (float)Kp, (float)Ki, (float)Kd);
+    prefs.putFloat("kp", Kp); prefs.putFloat("ki", Ki); prefs.putFloat("kd", Kd);
     request->send(200, "text/plain", "ok");
   });
 
@@ -698,6 +803,7 @@ void setup()
     if (request->hasParam("mode"))
       blackLineOnWhite = (request->getParam("mode")->value().toInt() == 1);
     Serial.printf("[SURFACE] blackLineOnWhite=%d\n", (int)blackLineOnWhite);
+    prefs.putBool("blw", blackLineOnWhite);
     request->send(200, "text/plain", "ok");
   });
 
@@ -730,6 +836,21 @@ void setup()
     json += ",\"baseSpeed\":"        + String(baseSpeed);
     json += ",\"blackLineOnWhite\":" + String(blackLineOnWhite ? 1 : 0);
     json += ",\"botState\":"         + String(botState);
+    json += ",\"correction\":"       + String(lastCorrection, 1);
+    json += ",\"lapCount\":"        + String(lapCount);
+    json += ",\"finished\":"         + String(raceFinished ? 1 : 0);
+    json += ",\"finishTimeMs\":"     + String(finishTimeMs);
+    json += ",\"sensorMin\":[";
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+      json += String(minValues[i]);
+      if (i < IR_SENSOR_COUNT - 1) json += ",";
+    }
+    json += "],\"sensorMax\":[";
+    for (int i = 0; i < IR_SENSOR_COUNT; i++) {
+      json += String(maxValues[i]);
+      if (i < IR_SENSOR_COUNT - 1) json += ",";
+    }
+    json += "],\"elapsedMs\":" + String(shouldRun ? (millis() - runStartMs) : 0);
     json += "}";
     request->send(200, "application/json", json);
   });
@@ -740,7 +861,12 @@ void setup()
       return;
     }
     resetPIDState();
-    shouldRun = true;
+    lapCount        = 0;
+    raceFinished    = false;
+    finishTimeMs    = 0;
+    wideLineLatched = false;
+    runStartMs      = millis();
+    shouldRun       = true;
     request->send(200, "text/plain", "started");
   });
 
@@ -753,6 +879,7 @@ void setup()
   server.on("/setSpeed", HTTP_GET, [](AsyncWebServerRequest *request) {
     if (request->hasParam("speed"))
       baseSpeed = constrain(request->getParam("speed")->value().toInt(), 0, 255);
+    prefs.putInt("speed", baseSpeed);
     request->send(200, "text/plain", String(baseSpeed));
   });
 
@@ -811,10 +938,37 @@ void loop()
     // Line truly lost — spin toward last known side
     botState = STATE_SEARCHING;
   } else {
-    // Recovery timeout — stop to avoid driving off completely
+    // Recovery timeout — stop completely and end the run
     setMotorSpeed(0, 0);
+    shouldRun = false;
     delay(10);
     return;
+  }
+
+  // ── Launch grace — brief settle after /start ───────────────
+  if (now - runStartMs < LAUNCH_GRACE_MS) {
+    setMotorSpeed(0, 0);
+    previous_error = currentErr;
+    integral = 0;
+    delay(5);
+    return;
+  }
+
+  // ── Finish detection: sustained wide dark area ─────────────
+  if (activeSensors >= WIDE_LINE_ACTIVE_SENSORS) {
+    if (!wideLineLatched) { wideLineStartMs = now; wideLineLatched = true; }
+    if (now - wideLineStartMs >= WIDE_LINE_HOLD_MS && !raceFinished) {
+      lapCount++;
+      raceFinished  = true;
+      finishTimeMs  = now - runStartMs;
+      shouldRun     = false;
+      setMotorSpeed(0, 0);
+      Serial.printf("[RACE] Finished after %lu ms, laps=%d\n", finishTimeMs, lapCount);
+      delay(10);
+      return;
+    }
+  } else {
+    wideLineLatched = false;
   }
 
   // ── COASTING: hold last speed, skip PID update ────────────
@@ -847,25 +1001,29 @@ void loop()
 
   integral  += currentErr;
   integral   = constrain(integral, -500.0f, 500.0f);
-  derivative = currentErr - previous_error;
+  derivative = 0.7f * derivative + 0.3f * (currentErr - previous_error);
 
   float correction = Kp * currentErr + Ki * integral + Kd * derivative;
   correction = constrain(correction, -150.0f, 150.0f);
+
+  // Adaptive base speed — slow down in curves, speed up on straights
+  int effBase = (int)(baseSpeed * (1.0f - 0.5f * fabsf(currentErr) / 75.0f));
+  effBase = constrain(effBase, 80, 255);
 
   int leftSpeed, rightSpeed;
 
   // Tank steer on sharp turns
   if (abs((int)currentErr) > TANK_ERROR_THRESHOLD) {
     if (currentErr > 0) {
-      leftSpeed  =  baseSpeed;
-      rightSpeed = -(int)(baseSpeed * TANK_TURN_MULTIPLIER);
+      leftSpeed  =  effBase;
+      rightSpeed = -(int)(effBase * TANK_TURN_MULTIPLIER);
     } else {
-      leftSpeed  = -(int)(baseSpeed * TANK_TURN_MULTIPLIER);
-      rightSpeed =  baseSpeed;
+      leftSpeed  = -(int)(effBase * TANK_TURN_MULTIPLIER);
+      rightSpeed =  effBase;
     }
   } else {
-    leftSpeed  = baseSpeed + (int)correction;
-    rightSpeed = baseSpeed - (int)correction;
+    leftSpeed  = effBase + (int)correction;
+    rightSpeed = effBase - (int)correction;
   }
 
   leftSpeed  = constrain(leftSpeed,  -255, 255);
@@ -873,6 +1031,7 @@ void loop()
 
   setMotorSpeed(leftSpeed, rightSpeed);
   previous_error = currentErr;
+  lastCorrection = correction;
 
   delay(5);
 }
