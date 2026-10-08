@@ -57,6 +57,7 @@ volatile float Kp = 2.0f;
 volatile float Ki = 0.0f;
 volatile float Kd = 1.0f;
 volatile int   baseSpeed = 200;
+volatile int   minSpeed = 80;
 
 float error          = 0;
 float previous_error = 0;
@@ -152,20 +153,34 @@ void calibrateSensors(bool spin)
   }
 
   // Self-sweep: spin in place so sensors cross line + background
-  if (spin) setMotorSpeed(150, -150);
-
-  unsigned long start = millis();
-  while (millis() - start < 5000) {
-    for (int j = 0; j < NUM_CHANNELS; j++) {
-      selectMuxChannel(j);
-      int r = analogRead(MUX_OUT);
-      if (r < minValues[j]) minValues[j] = r;
-      if (r > maxValues[j]) maxValues[j] = r;
+  if (spin) {
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+      unsigned long elapsed = millis() - start;
+      if      (elapsed < 1200) setMotorSpeed( 130, -130);
+      else if (elapsed < 3600) setMotorSpeed(-130,  130);
+      else                     setMotorSpeed( 130, -130);
+      for (int j = 0; j < NUM_CHANNELS; j++) {
+        selectMuxChannel(j);
+        int r = analogRead(MUX_OUT);
+        if (r < minValues[j]) minValues[j] = r;
+        if (r > maxValues[j]) maxValues[j] = r;
+      }
+      delay(5);
     }
-    delay(5);
+    setMotorSpeed(0, 0);
+  } else {
+    unsigned long start = millis();
+    while (millis() - start < 5000) {
+      for (int j = 0; j < NUM_CHANNELS; j++) {
+        selectMuxChannel(j);
+        int r = analogRead(MUX_OUT);
+        if (r < minValues[j]) minValues[j] = r;
+        if (r > maxValues[j]) maxValues[j] = r;
+      }
+      delay(5);
+    }
   }
-
-  setMotorSpeed(0, 0);
   delay(300);
 
   Serial.println("[CAL] Done:");
@@ -323,6 +338,7 @@ void setup()
   Ki               = prefs.getFloat("ki",    0.0f);
   Kd               = prefs.getFloat("kd",    1.0f);
   baseSpeed        = prefs.getInt ("speed", 200);
+  minSpeed         = prefs.getInt ("minspeed", 80);
   blackLineOnWhite = prefs.getBool("blw",   true);
   Serial.printf("[NVS] Kp=%.2f Ki=%.3f Kd=%.2f speed=%d blw=%d\n",
                 (float)Kp, (float)Ki, (float)Kd, (int)baseSpeed, (int)blackLineOnWhite);
@@ -455,6 +471,11 @@ void setup()
     <div class='lbl'>Base Speed <span class='v' id='spV'>--</span></div>
     <div class='row'>
       <input type='range' min='0' max='255' step='1' id='spS' oninput='setSpeed(this.value)'>
+    </div>
+
+    <div class='lbl'>Min Curve Speed <span class='v' id='minSpV'>--</span></div>
+    <div class='row'>
+      <input type='range' min='0' max='150' step='1' id='minSpS' oninput='setMinSpeed(this.value)'>
     </div>
 
     <div class='bgrp'>
@@ -628,6 +649,11 @@ void setup()
     fetch('/setSpeed?speed=' + v);
   }
 
+  function setMinSpeed(v) {
+    document.getElementById('minSpV').textContent = v;
+    fetch('/setMinSpeed?minspeed=' + v);
+  }
+
   function startRun() {
     fetch('/start').then(function(r) {
       if (!r.ok) r.text().then(function(t) { alert('Cannot start: ' + t); });
@@ -685,6 +711,11 @@ void setup()
     if (document.activeElement !== document.getElementById('spS')) {
       document.getElementById('spS').value = d.baseSpeed;
       document.getElementById('spV').textContent = d.baseSpeed;
+    }
+
+    if (document.activeElement !== document.getElementById('minSpS')) {
+      document.getElementById('minSpS').value = d.minSpeed;
+      document.getElementById('minSpV').textContent = d.minSpeed;
     }
 
     // Surface toggle
@@ -757,17 +788,17 @@ void setup()
       c.clearRect(0, 0, cv.width, cv.height);
       c.strokeStyle = 'rgba(255,255,255,0.15)';
       c.beginPath(); c.moveTo(0, cv.height/2); c.lineTo(cv.width, cv.height/2); c.stroke();
-      function plot(hist, color) {
+      function plot(hist, color, range) {
         c.strokeStyle = color; c.lineWidth = 2; c.beginPath();
         for (var i = 0; i < hist.length; i++) {
           var x = i / 119 * cv.width;
-          var y = cv.height/2 - (hist[i] / 75) * (cv.height/2 - 4);
+          var y = cv.height/2 - (hist[i] / range) * (cv.height/2 - 4);
           i === 0 ? c.moveTo(x, y) : c.lineTo(x, y);
         }
         c.stroke();
       }
-      plot(corrHist, '#a78bfa');
-      plot(errHist,  '#00ffcc');
+      plot(corrHist, '#a78bfa', 150);
+      plot(errHist,  '#00ffcc', 75);
     }
   }
 
@@ -834,6 +865,7 @@ void setup()
     json += ",\"calibrationDone\":"  + String(calibrationDone ? 1 : 0);
     json += ",\"running\":"          + String(shouldRun ? 1 : 0);
     json += ",\"baseSpeed\":"        + String(baseSpeed);
+    json += ",\"minSpeed\":"         + String(minSpeed);
     json += ",\"blackLineOnWhite\":" + String(blackLineOnWhite ? 1 : 0);
     json += ",\"botState\":"         + String(botState);
     json += ",\"correction\":"       + String(lastCorrection, 1);
@@ -883,6 +915,12 @@ void setup()
     request->send(200, "text/plain", String(baseSpeed));
   });
 
+  server.on("/setMinSpeed", HTTP_GET, [](AsyncWebServerRequest *request) {
+    minSpeed = constrain(request->getParam("minspeed")->value().toInt(), 0, 150);
+    prefs.putInt("minspeed", minSpeed);
+    request->send(200, "text/plain", String(minSpeed));
+  });
+
   server.on("/calibrate", HTTP_GET, [](AsyncWebServerRequest *request) {
     calibrationDone = false;
     shouldRun = false;
@@ -901,9 +939,6 @@ void setup()
 // ── Bot operating state ───────────────────────────────────────
 enum BotState { STATE_ON_LINE, STATE_COASTING, STATE_SEARCHING };
 BotState botState = STATE_ON_LINE;
-
-// ── Calibration pending flag ──────────────────────────────────
-volatile bool pendingCalibration = false;
 
 // ============================================================
 //  loop
@@ -955,7 +990,7 @@ void loop()
   }
 
   // ── Finish detection: sustained wide dark area ─────────────
-  if (activeSensors >= WIDE_LINE_ACTIVE_SENSORS) {
+  if (activeSensors >= WIDE_LINE_ACTIVE_SENSORS && (now - runStartMs) > 3000) {
     if (!wideLineLatched) { wideLineStartMs = now; wideLineLatched = true; }
     if (now - wideLineStartMs >= WIDE_LINE_HOLD_MS && !raceFinished) {
       lapCount++;
@@ -967,7 +1002,7 @@ void loop()
       delay(10);
       return;
     }
-  } else {
+  } else if (activeSensors < WIDE_LINE_ACTIVE_SENSORS) {
     wideLineLatched = false;
   }
 
@@ -1008,7 +1043,7 @@ void loop()
 
   // Adaptive base speed — slow down in curves, speed up on straights
   int effBase = (int)(baseSpeed * (1.0f - 0.5f * fabsf(currentErr) / 75.0f));
-  effBase = constrain(effBase, 80, 255);
+  effBase = constrain(effBase, minSpeed, 255);
 
   int leftSpeed, rightSpeed;
 
