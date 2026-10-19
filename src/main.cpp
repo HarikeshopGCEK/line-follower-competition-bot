@@ -27,12 +27,12 @@
 #define MUX_SETTLE_DELAY_US 100
 
 // ── Motor driver (TB6612FNG) pins ────────────────────────────
-#define ENA  27
-#define IN1  26
-#define IN2  25
-#define ENB  33
-#define IN3  32
-#define IN4   4
+#define ENA  33
+#define IN1  32
+#define IN2  4
+#define ENB  27
+#define IN3  26
+#define IN4  25
 #define STBY 21
 
 // ── LEDC PWM — Core v2.x API ─────────────────────────────────
