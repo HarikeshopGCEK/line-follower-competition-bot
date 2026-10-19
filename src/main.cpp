@@ -706,7 +706,7 @@ void setup()
     document.getElementById('calibV').textContent = d.calibrationDone ? '\u2713 Done' : 'Pending';
     document.getElementById('calibV').style.color = d.calibrationDone ? '#00ffcc' : '#f59e0b';
 
-    if (!pidFrozen) {
+    if (!pidFrozen && !pidDirty) {
       ['kp','ki','kd'].forEach(function(p) {
         var dec = p==='ki'?3:2;
         document.getElementById(p+'V').textContent = d[p].toFixed(dec);
