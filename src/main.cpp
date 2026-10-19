@@ -450,22 +450,22 @@ void setup()
   <div class='lbl'>Kp <span class='v' id='kpV'>--</span></div>
   <div class='row'>
     <!-- 🟠 Tightened max: 20→5 -->
-    <input type='range' min='0' max='5' step='0.01' id='kpS' oninput='sync("kp",this.value)'>
-    <input type='number' min='0' max='5' step='0.01' class='num' id='kpN' oninput='syncS("kp",this.value,5)'>
+    <input type='range' min='0' max='20' step='0.01' id='kpS' oninput='sync("kp",this.value)'>
+    <input type='number' min='0' max='20' class='num' id='kpN' oninput='syncS("kp",this.value,5)'>
   </div>
 
   <div class='lbl'>Ki <span class='v' id='kiV'>--</span></div>
   <div class='row'>
     <!-- 🟠 Tightened max: 2→0.1, finer step -->
-    <input type='range' min='0' max='0.1' step='0.001' id='kiS' oninput='sync("ki",this.value)'>
-    <input type='number' min='0' max='0.1' step='0.001' class='num' id='kiN' oninput='syncS("ki",this.value,0.1)'>
+    <input type='range' min='0' max='0.2' step='0.001' id='kiS' oninput='sync("ki",this.value)'>
+    <input type='number' min='0' max='0.2' class='num' id='kiN' oninput='syncS("ki",this.value,0.1)'>
   </div>
 
   <div class='lbl'>Kd <span class='v' id='kdV'>--</span></div>
   <div class='row'>
     <!-- 🟠 Tightened max: 10→8 -->
-    <input type='range' min='0' max='8' step='0.01' id='kdS' oninput='sync("kd",this.value)'>
-    <input type='number' min='0' max='8' step='0.01' class='num' id='kdN' oninput='syncS("kd",this.value,8)'>
+    <input type='range' min='0' max='10' step='0.01' id='kdS' oninput='sync("kd",this.value)'>
+    <input type='number' min='0' max='10' class='num' id='kdN' oninput='syncS("kd",this.value,8)'>
   </div>
 
   <div class='bgrp'>
