@@ -604,6 +604,66 @@ void setup()
 
   // ── Freeze flag: stops poll overwriting sliders after Apply ──
   var pidFrozen = false;
+  var sliderSync = {
+    base: { pending: false, desired: null, timer: null, reqSeq: 0, editSeq: 0, ackEditSeq: 0, retryTimer: null },
+    min:  { pending: false, desired: null, timer: null, reqSeq: 0, editSeq: 0, ackEditSeq: 0, retryTimer: null }
+  };
+  var pidSyncState = { pending: false, kp: null, ki: null, kd: null };
+
+  function toNumber(v) {
+    var n = Number(v);
+    return isNaN(n) ? null : n;
+  }
+
+  function sameNumber(a, b) {
+    var na = toNumber(a), nb = toNumber(b);
+    return na !== null && nb !== null && na === nb;
+  }
+
+  function clampForSlider(id, value) {
+    var el = document.getElementById(id);
+    if (!el) return null;
+    var n = toNumber(value);
+    if (n === null) return null;
+    var mn = toNumber(el.min); if (mn === null) mn = n;
+    var mx = toNumber(el.max); if (mx === null) mx = n;
+    return Math.max(mn, Math.min(mx, n));
+  }
+
+  function scheduleSliderUpdate(state, fetchUrl) {
+    clearTimeout(state.timer);
+    state.timer = setTimeout(function() {
+      var seq = ++state.reqSeq;
+      var editSeq = state.editSeq;
+      var desired = state.desired;
+      fetch(fetchUrl(desired))
+        .then(function(r) {
+          if (!r.ok) throw new Error('request_failed');
+          state.ackEditSeq = Math.max(state.ackEditSeq, editSeq);
+          clearTimeout(state.retryTimer);
+        })
+        .catch(function() {
+          if (seq !== state.reqSeq || editSeq !== state.editSeq) return;
+          clearTimeout(state.retryTimer);
+          state.retryTimer = setTimeout(function() {
+            scheduleSliderUpdate(state, fetchUrl);
+          }, 400);
+        });
+    }, 120);
+  }
+
+  function reconcilePendingSlider(state, serverValue, sliderId, valueId) {
+    if (!state.pending) return true;
+    if (state.ackEditSeq >= state.editSeq && sameNumber(serverValue, state.desired)) {
+      state.pending = false;
+      return true;
+    }
+    var slider = document.getElementById(sliderId);
+    var value = document.getElementById(valueId);
+    if (slider && document.activeElement !== slider) slider.value = state.desired;
+    if (value) value.textContent = state.desired;
+    return false;
+  }
 
   function sync(p, v) {
     var dec = p === 'ki' ? 3 : 2;
@@ -622,17 +682,22 @@ void setup()
     var kp = document.getElementById('kpN').value;
     var ki = document.getElementById('kiN').value;
     var kd = document.getElementById('kdN').value;
+    pidSyncState.pending = true;
+    pidSyncState.kp = Number(toNumber(kp) !== null ? toNumber(kp).toFixed(2) : kp);
+    pidSyncState.ki = Number(toNumber(ki) !== null ? toNumber(ki).toFixed(3) : ki);
+    pidSyncState.kd = Number(toNumber(kd) !== null ? toNumber(kd).toFixed(2) : kd);
     fetch('/set?kp=' + kp + '&ki=' + ki + '&kd=' + kd).then(function(r) {
-      if (r.ok) {
-        pidFrozen = true;
-        setTimeout(function() { pidFrozen = false; }, 1200);
-        var t = document.getElementById('toast');
-        t.classList.add('show');
-        setTimeout(function() { t.classList.remove('show'); }, 1800);
-        var btn = document.getElementById('applyBtn');
-        btn.textContent = 'Applied ✓';
-        setTimeout(function() { btn.textContent = 'Apply PID'; }, 1500);
-      }
+      if (!r.ok) throw new Error('pid_update_failed');
+      pidFrozen = true;
+      setTimeout(function() { pidFrozen = false; }, 1200);
+      var t = document.getElementById('toast');
+      t.classList.add('show');
+      setTimeout(function() { t.classList.remove('show'); }, 1800);
+      var btn = document.getElementById('applyBtn');
+      btn.textContent = 'Applied ✓';
+      setTimeout(function() { btn.textContent = 'Apply PID'; }, 1500);
+    }).catch(function() {
+      pidFrozen = false;
     });
   }
 
@@ -645,13 +710,41 @@ void setup()
   }
 
   function setSpeed(v) {
-    document.getElementById('spV').textContent = v;
-    fetch('/setSpeed?speed=' + v);
+    var n = clampForSlider('spS', v);
+    if (n === null) return;
+    var rounded = String(Math.round(n));
+    var slider = document.getElementById('spS');
+    var value = document.getElementById('spV');
+    if (slider) slider.value = rounded;
+    if (value) value.textContent = rounded;
+
+    var state = sliderSync.base;
+    state.editSeq += 1;
+    state.desired = rounded;
+    state.pending = true;
+    clearTimeout(state.retryTimer);
+    scheduleSliderUpdate(state, function(nextValue) {
+      return '/setSpeed?speed=' + encodeURIComponent(nextValue);
+    });
   }
 
   function setMinSpeed(v) {
-    document.getElementById('minSpV').textContent = v;
-    fetch('/setMinSpeed?minspeed=' + v);
+    var n = clampForSlider('minSpS', v);
+    if (n === null) return;
+    var rounded = String(Math.round(n));
+    var slider = document.getElementById('minSpS');
+    var value = document.getElementById('minSpV');
+    if (slider) slider.value = rounded;
+    if (value) value.textContent = rounded;
+
+    var state = sliderSync.min;
+    state.editSeq += 1;
+    state.desired = rounded;
+    state.pending = true;
+    clearTimeout(state.retryTimer);
+    scheduleSliderUpdate(state, function(nextValue) {
+      return '/setMinSpeed?minspeed=' + encodeURIComponent(nextValue);
+    });
   }
 
   function startRun() {
@@ -695,25 +788,36 @@ void setup()
     document.getElementById('calibV').textContent = d.calibrationDone ? '✓ Done' : 'Pending';
     document.getElementById('calibV').style.color = d.calibrationDone ? '#00ffcc' : '#f59e0b';
 
+    if (pidSyncState.pending &&
+        sameNumber(d.kp, pidSyncState.kp) &&
+        sameNumber(d.ki, pidSyncState.ki) &&
+        sameNumber(d.kd, pidSyncState.kd)) {
+      pidSyncState.pending = false;
+    }
+
     // PID sliders (only when not frozen)
     if (!pidFrozen) {
       ['kp','ki','kd'].forEach(function(p) {
         var dec = p === 'ki' ? 3 : 2;
-        document.getElementById(p + 'V').textContent = d[p].toFixed(dec);
+        var desired = pidSyncState.pending ? pidSyncState[p] : d[p];
+        if (desired === null || typeof desired === 'undefined') desired = d[p];
+        document.getElementById(p + 'V').textContent = Number(desired).toFixed(dec);
         if (document.activeElement !== document.getElementById(p + 'S'))
-          document.getElementById(p + 'S').value = d[p];
+          document.getElementById(p + 'S').value = desired;
         if (document.activeElement !== document.getElementById(p + 'N'))
-          document.getElementById(p + 'N').value = d[p].toFixed(dec);
+          document.getElementById(p + 'N').value = Number(desired).toFixed(dec);
       });
     }
 
     // Speed
-    if (document.activeElement !== document.getElementById('spS')) {
+    if (reconcilePendingSlider(sliderSync.base, d.baseSpeed, 'spS', 'spV') &&
+        document.activeElement !== document.getElementById('spS')) {
       document.getElementById('spS').value = d.baseSpeed;
       document.getElementById('spV').textContent = d.baseSpeed;
     }
 
-    if (document.activeElement !== document.getElementById('minSpS')) {
+    if (reconcilePendingSlider(sliderSync.min, d.minSpeed, 'minSpS', 'minSpV') &&
+        document.activeElement !== document.getElementById('minSpS')) {
       document.getElementById('minSpS').value = d.minSpeed;
       document.getElementById('minSpV').textContent = d.minSpeed;
     }
