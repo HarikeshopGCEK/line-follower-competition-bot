@@ -13,6 +13,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <Preferences.h>
+#include <math.h>
 
 // ── Multiplexer (CD4067) pins ────────────────────────────────
 #define S0 12
@@ -58,6 +59,11 @@ volatile float Ki = 0.0f;
 volatile float Kd = 1.0f;
 volatile int   baseSpeed = 200;
 volatile int   minSpeed = 80;
+
+static float clampFiniteFloat(float value, float fallback, float minValue, float maxValue) {
+  if (!isfinite(value)) value = fallback;
+  return constrain(value, minValue, maxValue);
+}
 
 float error          = 0;
 float previous_error = 0;
@@ -340,6 +346,11 @@ void setup()
   baseSpeed        = prefs.getInt ("speed", 200);
   minSpeed         = prefs.getInt ("minspeed", 80);
   blackLineOnWhite = prefs.getBool("blw",   true);
+  Kp               = clampFiniteFloat((float)Kp, 2.0f, 0.0f, 20.0f);
+  Ki               = clampFiniteFloat((float)Ki, 0.0f, 0.0f, 2.0f);
+  Kd               = clampFiniteFloat((float)Kd, 1.0f, 0.0f, 10.0f);
+  baseSpeed        = constrain((int)baseSpeed, 0, 255);
+  minSpeed         = constrain((int)minSpeed, 0, 150);
   Serial.printf("[NVS] Kp=%.2f Ki=%.3f Kd=%.2f speed=%d blw=%d\n",
                 (float)Kp, (float)Ki, (float)Kd, (int)baseSpeed, (int)blackLineOnWhite);
 
@@ -604,17 +615,80 @@ void setup()
 
   // ── Freeze flag: stops poll overwriting sliders after Apply ──
   var pidFrozen = false;
+  var uiInitialized = false;
+
+  var PID_CFG = {
+    kp: { min: 0, max: 20, dec: 2 },
+    ki: { min: 0, max: 2,  dec: 3 },
+    kd: { min: 0, max: 10, dec: 2 }
+  };
+
+  function finiteOrNull(v) {
+    var n = Number(v);
+    return isFinite(n) ? n : null;
+  }
+
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function clampForSlider(sliderId, v) {
+    var slider = document.getElementById(sliderId);
+    var n = finiteOrNull(v);
+    if (!slider || n === null) return null;
+    var min = finiteOrNull(slider.min);
+    var max = finiteOrNull(slider.max);
+    if (min !== null) n = Math.max(min, n);
+    if (max !== null) n = Math.min(max, n);
+    return n;
+  }
+
+  function setPidControl(p, rawValue, protectActive) {
+    var cfg = PID_CFG[p];
+    if (!cfg) return;
+    var n = finiteOrNull(rawValue);
+    if (n === null) return;
+    n = clamp(n, cfg.min, cfg.max);
+    var fixed = n.toFixed(cfg.dec);
+    var slider = document.getElementById(p + 'S');
+    var num = document.getElementById(p + 'N');
+    var val = document.getElementById(p + 'V');
+    if (val) val.textContent = fixed;
+    if (slider && (!protectActive || document.activeElement !== slider)) slider.value = fixed;
+    if (num && (!protectActive || document.activeElement !== num)) num.value = fixed;
+  }
+
+  function setSpeedControl(sliderId, valueId, rawValue, protectActive) {
+    var n = clampForSlider(sliderId, rawValue);
+    if (n === null) return;
+    var rounded = String(Math.round(n));
+    var slider = document.getElementById(sliderId);
+    var value = document.getElementById(valueId);
+    if (slider && (!protectActive || document.activeElement !== slider)) slider.value = rounded;
+    if (value) value.textContent = rounded;
+  }
+
+  function initControlsFromData(d) {
+    ['kp','ki','kd'].forEach(function(p) { setPidControl(p, d[p], false); });
+    setSpeedControl('spS', 'spV', d.baseSpeed, false);
+    setSpeedControl('minSpS', 'minSpV', d.minSpeed, false);
+    var isBlackOnWhite = !!d.blackLineOnWhite;
+    document.getElementById('surfTog').checked = isBlackOnWhite;
+    document.getElementById('surfLbl').textContent =
+      isBlackOnWhite ? 'Black line on white surface' : 'White line on black surface';
+    uiInitialized = true;
+  }
 
   function sync(p, v) {
-    var dec = p === 'ki' ? 3 : 2;
-    document.getElementById(p + 'V').textContent = parseFloat(v).toFixed(dec);
-    document.getElementById(p + 'N').value = parseFloat(v).toFixed(dec);
+    setPidControl(p, v, false);
   }
   function syncS(p, v, max) {
-    var n = parseFloat(v);
-    if (!isNaN(n) && n >= 0 && n <= max) {
-      document.getElementById(p + 'S').value = n; sync(p, v);
-    }
+    var cfg = PID_CFG[p];
+    var n = finiteOrNull(v);
+    if (!cfg || n === null) return;
+    n = clamp(n, cfg.min, cfg.max);
+    document.getElementById(p + 'S').value = n.toFixed(cfg.dec);
+    sync(p, n);
   }
 
   // ── AJAX PID apply ────────────────────────────────────────
@@ -645,13 +719,21 @@ void setup()
   }
 
   function setSpeed(v) {
-    document.getElementById('spV').textContent = v;
-    fetch('/setSpeed?speed=' + v);
+    var n = clampForSlider('spS', v);
+    if (n === null) return;
+    var rounded = String(Math.round(n));
+    document.getElementById('spS').value = rounded;
+    document.getElementById('spV').textContent = rounded;
+    fetch('/setSpeed?speed=' + rounded);
   }
 
   function setMinSpeed(v) {
-    document.getElementById('minSpV').textContent = v;
-    fetch('/setMinSpeed?minspeed=' + v);
+    var n = clampForSlider('minSpS', v);
+    if (n === null) return;
+    var rounded = String(Math.round(n));
+    document.getElementById('minSpS').value = rounded;
+    document.getElementById('minSpV').textContent = rounded;
+    fetch('/setMinSpeed?minspeed=' + rounded);
   }
 
   function startRun() {
@@ -675,6 +757,9 @@ void setup()
 
   // ── Poll & update UI ──────────────────────────────────────
   function updateUI(d) {
+    if (!d || typeof d !== 'object') return;
+    if (!uiInitialized) initControlsFromData(d);
+
     // status
     var dot = document.getElementById('sdot');
     var txt = document.getElementById('stxt');
@@ -697,26 +782,12 @@ void setup()
 
     // PID sliders (only when not frozen)
     if (!pidFrozen) {
-      ['kp','ki','kd'].forEach(function(p) {
-        var dec = p === 'ki' ? 3 : 2;
-        document.getElementById(p + 'V').textContent = d[p].toFixed(dec);
-        if (document.activeElement !== document.getElementById(p + 'S'))
-          document.getElementById(p + 'S').value = d[p];
-        if (document.activeElement !== document.getElementById(p + 'N'))
-          document.getElementById(p + 'N').value = d[p].toFixed(dec);
-      });
+      ['kp','ki','kd'].forEach(function(p) { setPidControl(p, d[p], true); });
     }
 
     // Speed
-    if (document.activeElement !== document.getElementById('spS')) {
-      document.getElementById('spS').value = d.baseSpeed;
-      document.getElementById('spV').textContent = d.baseSpeed;
-    }
-
-    if (document.activeElement !== document.getElementById('minSpS')) {
-      document.getElementById('minSpS').value = d.minSpeed;
-      document.getElementById('minSpV').textContent = d.minSpeed;
-    }
+    setSpeedControl('spS', 'spV', d.baseSpeed, true);
+    setSpeedControl('minSpS', 'minSpV', d.minSpeed, true);
 
     // Surface toggle
     document.getElementById('surfTog').checked = !!d.blackLineOnWhite;
@@ -812,7 +883,7 @@ void setup()
       });
   }
 
-  window.onload = function() { setInterval(poll, 150); };
+  window.onload = function() { poll(); setInterval(poll, 150); };
 </script>
 </body>
 </html>)raw";
@@ -821,9 +892,18 @@ void setup()
 
   // PID — AJAX, no redirect
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (request->hasParam("kp")) Kp = request->getParam("kp")->value().toFloat();
-    if (request->hasParam("ki")) Ki = request->getParam("ki")->value().toFloat();
-    if (request->hasParam("kd")) Kd = request->getParam("kd")->value().toFloat();
+    if (request->hasParam("kp")) {
+      float kp = request->getParam("kp")->value().toFloat();
+      if (isfinite(kp)) Kp = constrain(kp, 0.0f, 20.0f);
+    }
+    if (request->hasParam("ki")) {
+      float ki = request->getParam("ki")->value().toFloat();
+      if (isfinite(ki)) Ki = constrain(ki, 0.0f, 2.0f);
+    }
+    if (request->hasParam("kd")) {
+      float kd = request->getParam("kd")->value().toFloat();
+      if (isfinite(kd)) Kd = constrain(kd, 0.0f, 10.0f);
+    }
     Serial.printf("[PID] Kp=%.3f Ki=%.4f Kd=%.3f\n", (float)Kp, (float)Ki, (float)Kd);
     prefs.putFloat("kp", Kp); prefs.putFloat("ki", Ki); prefs.putFloat("kd", Kd);
     request->send(200, "text/plain", "ok");
@@ -847,6 +927,12 @@ void setup()
       botState = (gapMs < DOTTED_COAST_MS) ? 1 : 2;
     }
 
+    float safeKp = clampFiniteFloat((float)Kp, 2.0f, 0.0f, 20.0f);
+    float safeKi = clampFiniteFloat((float)Ki, 0.0f, 0.0f, 2.0f);
+    float safeKd = clampFiniteFloat((float)Kd, 1.0f, 0.0f, 10.0f);
+    int safeBaseSpeed = constrain((int)baseSpeed, 0, 255);
+    int safeMinSpeed = constrain((int)minSpeed, 0, 150);
+
     String json = "{\"sensorStates\":[";
     for (int i = 0; i < IR_SENSOR_COUNT; i++) {
       json += String(sensorStates[i]);
@@ -859,13 +945,13 @@ void setup()
     }
     json += "],\"error\":"           + String(currentError);
     json += ",\"activeSensors\":"    + String(activeSensors);
-    json += ",\"kp\":"               + String(Kp, 4);
-    json += ",\"ki\":"               + String(Ki, 5);
-    json += ",\"kd\":"               + String(Kd, 4);
+    json += ",\"kp\":"               + String(safeKp, 4);
+    json += ",\"ki\":"               + String(safeKi, 5);
+    json += ",\"kd\":"               + String(safeKd, 4);
     json += ",\"calibrationDone\":"  + String(calibrationDone ? 1 : 0);
     json += ",\"running\":"          + String(shouldRun ? 1 : 0);
-    json += ",\"baseSpeed\":"        + String(baseSpeed);
-    json += ",\"minSpeed\":"         + String(minSpeed);
+    json += ",\"baseSpeed\":"        + String(safeBaseSpeed);
+    json += ",\"minSpeed\":"         + String(safeMinSpeed);
     json += ",\"blackLineOnWhite\":" + String(blackLineOnWhite ? 1 : 0);
     json += ",\"botState\":"         + String(botState);
     json += ",\"correction\":"       + String(lastCorrection, 1);
